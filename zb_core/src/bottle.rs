@@ -8,8 +8,22 @@ pub struct SelectedBottle {
 }
 
 pub fn select_bottle(formula: &Formula) -> Result<SelectedBottle, Error> {
+    // Prefer macOS ARM bottles in order of preference (newest first)
+    let macos_tags = ["arm64_tahoe", "arm64_sequoia", "arm64_sonoma", "arm64_ventura"];
+
+    for preferred_tag in macos_tags {
+        if let Some(file) = formula.bottle.stable.files.get(preferred_tag) {
+            return Ok(SelectedBottle {
+                tag: preferred_tag.to_string(),
+                url: file.url.clone(),
+                sha256: file.sha256.clone(),
+            });
+        }
+    }
+
+    // Fallback: any arm64 macOS bottle (but not linux)
     for (tag, file) in &formula.bottle.stable.files {
-        if tag.starts_with("arm64_") {
+        if tag.starts_with("arm64_") && !tag.contains("linux") {
             return Ok(SelectedBottle {
                 tag: tag.clone(),
                 url: file.url.clone(),

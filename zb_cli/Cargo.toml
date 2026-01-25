@@ -10,6 +10,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+indicatif = "0.17"
+console = "0.15"
 
 zb_core = { path = "../zb_core" }
 zb_io = { path = "../zb_io" }

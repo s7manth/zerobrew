@@ -17,7 +17,10 @@ pub struct Cellar {
 
 impl Cellar {
     pub fn new(root: &Path) -> io::Result<Self> {
-        let cellar_dir = root.join("cellar");
+        Self::new_at(root.join("cellar"))
+    }
+
+    pub fn new_at(cellar_dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&cellar_dir)?;
         Ok(Self { cellar_dir })
     }
@@ -55,6 +58,14 @@ impl Cellar {
 
         // Copy the content to the cellar using best available strategy
         copy_dir_with_fallback(&src_path, &keg_path)?;
+
+        // Patch Homebrew placeholders in Mach-O binaries
+        #[cfg(target_os = "macos")]
+        patch_homebrew_placeholders(&keg_path, &self.cellar_dir)?;
+
+        // Strip quarantine xattrs and ad-hoc sign Mach-O binaries
+        #[cfg(target_os = "macos")]
+        codesign_and_strip_xattrs(&keg_path)?;
 
         Ok(keg_path)
     }
@@ -108,6 +119,175 @@ fn find_bottle_content(store_entry: &Path, name: &str, version: &str) -> Result<
 
     // Fall back to store entry root (for flat tarballs or tests)
     Ok(store_entry.to_path_buf())
+}
+
+/// Patch @@HOMEBREW_CELLAR@@ and @@HOMEBREW_PREFIX@@ placeholders in Mach-O binaries
+#[cfg(target_os = "macos")]
+fn patch_homebrew_placeholders(keg_path: &Path, cellar_dir: &Path) -> Result<(), Error> {
+    use std::process::Command;
+
+    // Derive prefix from cellar (cellar_dir is typically prefix/Cellar)
+    let prefix = cellar_dir
+        .parent()
+        .unwrap_or(Path::new("/opt/homebrew"));
+
+    let cellar_str = cellar_dir.to_string_lossy();
+    let prefix_str = prefix.to_string_lossy();
+
+    // Walk all files in the keg
+    for entry in walkdir::WalkDir::new(keg_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        // Check if it's a Mach-O file by looking at magic bytes
+        if let Ok(data) = fs::read(path) {
+            if data.len() < 4 {
+                continue;
+            }
+            // Mach-O magic: 0xfeedface (32-bit), 0xfeedfacf (64-bit), or fat binary
+            let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+            let is_macho = matches!(
+                magic,
+                0xfeedface | 0xfeedfacf | 0xcafebabe | 0xcefaedfe | 0xcffaedfe
+            );
+            if !is_macho {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        // Get current install names
+        let output = Command::new("otool")
+            .args(["-L", &path.to_string_lossy()])
+            .output();
+
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Find lines with placeholders and patch them
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.contains("@@HOMEBREW_CELLAR@@") || line.contains("@@HOMEBREW_PREFIX@@") {
+                // Extract the path (before the compatibility version info)
+                if let Some(old_path) = line.split_whitespace().next() {
+                    let new_path = old_path
+                        .replace("@@HOMEBREW_CELLAR@@", &cellar_str)
+                        .replace("@@HOMEBREW_PREFIX@@", &prefix_str);
+
+                    // Use install_name_tool to patch
+                    let _ = Command::new("install_name_tool")
+                        .args(["-change", old_path, &new_path, &path.to_string_lossy()])
+                        .output();
+                }
+            }
+        }
+
+        // Also patch the ID if it has placeholders
+        let output = Command::new("otool")
+            .args(["-D", &path.to_string_lossy()])
+            .output();
+
+        if let Ok(o) = output {
+            if o.status.success() {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                for line in stdout.lines().skip(1) {
+                    // Skip first line (filename)
+                    let line = line.trim();
+                    if line.contains("@@HOMEBREW_CELLAR@@") || line.contains("@@HOMEBREW_PREFIX@@")
+                    {
+                        let new_id = line
+                            .replace("@@HOMEBREW_CELLAR@@", &cellar_str)
+                            .replace("@@HOMEBREW_PREFIX@@", &prefix_str);
+
+                        let _ = Command::new("install_name_tool")
+                            .args(["-id", &new_id, &path.to_string_lossy()])
+                            .output();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Strip quarantine extended attributes and ad-hoc sign Mach-O binaries.
+/// This is necessary because clonefile preserves xattrs including com.apple.quarantine
+/// and com.apple.provenance, which can cause macOS to kill unsigned binaries.
+#[cfg(target_os = "macos")]
+fn codesign_and_strip_xattrs(keg_path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    for entry in walkdir::WalkDir::new(keg_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        // Get current permissions
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let original_mode = metadata.permissions().mode();
+        let is_readonly = original_mode & 0o200 == 0;
+
+        // Make writable if needed
+        if is_readonly {
+            let mut perms = metadata.permissions();
+            perms.set_mode(original_mode | 0o200);
+            let _ = fs::set_permissions(path, perms);
+        }
+
+        // Strip quarantine xattrs
+        let _ = Command::new("xattr")
+            .args(["-d", "com.apple.quarantine", &path.to_string_lossy()])
+            .output();
+        let _ = Command::new("xattr")
+            .args(["-d", "com.apple.provenance", &path.to_string_lossy()])
+            .output();
+
+        // Check if it's a Mach-O file and ad-hoc sign it
+        if let Ok(data) = fs::read(path) {
+            if data.len() >= 4 {
+                let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                let is_macho = matches!(
+                    magic,
+                    0xfeedface | 0xfeedfacf | 0xcafebabe | 0xcefaedfe | 0xcffaedfe
+                );
+                if is_macho {
+                    let _ = Command::new("codesign")
+                        .args(["--force", "--sign", "-", &path.to_string_lossy()])
+                        .output();
+                }
+            }
+        }
+
+        // Restore original permissions
+        if is_readonly {
+            let mut perms = metadata.permissions();
+            perms.set_mode(original_mode);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+
+    Ok(())
 }
 
 fn copy_dir_with_fallback(src: &Path, dst: &Path) -> Result<(), Error> {

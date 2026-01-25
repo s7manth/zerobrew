@@ -4,14 +4,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
+use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH, WWW_AUTHENTICATE};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::blob::BlobCache;
+use crate::progress::InstallProgress;
 use zb_core::Error;
+
+/// Callback for download progress updates
+pub type DownloadProgressCallback = Arc<dyn Fn(InstallProgress) + Send + Sync>;
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -35,7 +39,24 @@ impl Downloader {
     }
 
     pub async fn download(&self, url: &str, expected_sha256: &str) -> Result<PathBuf, Error> {
+        self.download_with_progress(url, expected_sha256, None, None).await
+    }
+
+    pub async fn download_with_progress(
+        &self,
+        url: &str,
+        expected_sha256: &str,
+        name: Option<String>,
+        progress: Option<DownloadProgressCallback>,
+    ) -> Result<PathBuf, Error> {
         if self.blob_cache.has_blob(expected_sha256) {
+            // Report as already complete
+            if let (Some(cb), Some(n)) = (&progress, &name) {
+                cb(InstallProgress::DownloadCompleted {
+                    name: n.clone(),
+                    total_bytes: 0,
+                });
+            }
             return Ok(self.blob_cache.blob_path(expected_sha256));
         }
 
@@ -60,7 +81,7 @@ impl Downloader {
             });
         }
 
-        self.download_response(response, expected_sha256).await
+        self.download_response_with_progress(response, expected_sha256, name, progress).await
     }
 
     async fn handle_auth_challenge(
@@ -145,6 +166,31 @@ impl Downloader {
         response: reqwest::Response,
         expected_sha256: &str,
     ) -> Result<PathBuf, Error> {
+        self.download_response_with_progress(response, expected_sha256, None, None).await
+    }
+
+    async fn download_response_with_progress(
+        &self,
+        response: reqwest::Response,
+        expected_sha256: &str,
+        name: Option<String>,
+        progress: Option<DownloadProgressCallback>,
+    ) -> Result<PathBuf, Error> {
+        // Get content length for progress tracking
+        let total_bytes = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        // Report download started
+        if let (Some(cb), Some(n)) = (&progress, &name) {
+            cb(InstallProgress::DownloadStarted {
+                name: n.clone(),
+                total_bytes,
+            });
+        }
+
         let mut writer = self
             .blob_cache
             .start_write(expected_sha256)
@@ -154,16 +200,27 @@ impl Downloader {
 
         let mut hasher = Sha256::new();
         let mut stream = response.bytes_stream();
+        let mut downloaded: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| Error::NetworkFailure {
                 message: format!("failed to read chunk: {e}"),
             })?;
 
+            downloaded += chunk.len() as u64;
             hasher.update(&chunk);
             writer.write_all(&chunk).map_err(|e| Error::NetworkFailure {
                 message: format!("failed to write chunk: {e}"),
             })?;
+
+            // Report progress
+            if let (Some(cb), Some(n)) = (&progress, &name) {
+                cb(InstallProgress::DownloadProgress {
+                    name: n.clone(),
+                    downloaded,
+                    total_bytes,
+                });
+            }
         }
 
         let actual_hash = format!("{:x}", hasher.finalize());
@@ -172,6 +229,14 @@ impl Downloader {
             return Err(Error::ChecksumMismatch {
                 expected: expected_sha256.to_string(),
                 actual: actual_hash,
+            });
+        }
+
+        // Report download completed
+        if let (Some(cb), Some(n)) = (&progress, &name) {
+            cb(InstallProgress::DownloadCompleted {
+                name: n.clone(),
+                total_bytes: downloaded,
             });
         }
 
@@ -217,6 +282,7 @@ fn parse_www_authenticate(header: &str) -> Result<(String, String, String), Erro
 pub struct DownloadRequest {
     pub url: String,
     pub sha256: String,
+    pub name: String,
 }
 
 type InflightMap = HashMap<String, Arc<tokio::sync::broadcast::Sender<Result<PathBuf, String>>>>;
@@ -240,15 +306,24 @@ impl ParallelDownloader {
         &self,
         requests: Vec<DownloadRequest>,
     ) -> Result<Vec<PathBuf>, Error> {
+        self.download_all_with_progress(requests, None).await
+    }
+
+    pub async fn download_all_with_progress(
+        &self,
+        requests: Vec<DownloadRequest>,
+        progress: Option<DownloadProgressCallback>,
+    ) -> Result<Vec<PathBuf>, Error> {
         let handles: Vec<_> = requests
             .into_iter()
             .map(|req| {
                 let downloader = self.downloader.clone();
                 let semaphore = self.semaphore.clone();
                 let inflight = self.inflight.clone();
+                let progress = progress.clone();
 
                 tokio::spawn(async move {
-                    Self::download_with_dedup(downloader, semaphore, inflight, req).await
+                    Self::download_with_dedup(downloader, semaphore, inflight, req, progress).await
                 })
             })
             .collect();
@@ -269,6 +344,7 @@ impl ParallelDownloader {
         semaphore: Arc<Semaphore>,
         inflight: Arc<Mutex<InflightMap>>,
         req: DownloadRequest,
+        progress: Option<DownloadProgressCallback>,
     ) -> Result<PathBuf, Error> {
         // Check if there's already an inflight request for this sha256
         let mut receiver = {
@@ -299,7 +375,9 @@ impl ParallelDownloader {
             message: format!("semaphore error: {e}"),
         })?;
 
-        let result = downloader.download(&req.url, &req.sha256).await;
+        let result = downloader
+            .download_with_progress(&req.url, &req.sha256, Some(req.name), progress)
+            .await;
 
         // Notify waiters and clean up
         {
@@ -443,6 +521,7 @@ mod tests {
                 DownloadRequest {
                     url: format!("{}/file{i}.tar.gz", mock_server.uri()),
                     sha256,
+                    name: format!("pkg{i}"),
                 }
             })
             .collect();
@@ -482,9 +561,10 @@ mod tests {
 
         // Create 5 requests for the SAME blob
         let requests: Vec<_> = (0..5)
-            .map(|_| DownloadRequest {
+            .map(|i| DownloadRequest {
                 url: format!("{}/dedup.tar.gz", mock_server.uri()),
                 sha256: actual_sha256.clone(),
+                name: format!("dedup{i}"),
             })
             .collect();
 

@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::api::ApiClient;
 use crate::blob::BlobCache;
 use crate::db::Database;
-use crate::download::{DownloadRequest, ParallelDownloader};
+use crate::download::{DownloadProgressCallback, DownloadRequest, ParallelDownloader};
 use crate::link::Linker;
 use crate::materialize::Cellar;
+use crate::progress::{InstallProgress, ProgressCallback};
 use crate::store::Store;
 
 use zb_core::{resolve_closure, select_bottle, Error, Formula, SelectedBottle};
@@ -18,11 +20,17 @@ pub struct Installer {
     cellar: Cellar,
     linker: Linker,
     db: Database,
+    homebrew_cellar: Option<PathBuf>,
 }
 
 pub struct InstallPlan {
     pub formulas: Vec<Formula>,
     pub bottles: Vec<SelectedBottle>,
+}
+
+pub struct ExecuteResult {
+    pub installed: usize,
+    pub skipped_homebrew: Vec<String>,
 }
 
 impl Installer {
@@ -34,6 +42,7 @@ impl Installer {
         linker: Linker,
         db: Database,
         download_concurrency: usize,
+        homebrew_cellar: Option<PathBuf>,
     ) -> Self {
         Self {
             api_client,
@@ -42,6 +51,17 @@ impl Installer {
             cellar,
             linker,
             db,
+            homebrew_cellar,
+        }
+    }
+
+    /// Check if a package exists in Homebrew's Cellar (any version)
+    fn is_in_homebrew(&self, name: &str) -> bool {
+        if let Some(ref cellar_path) = self.homebrew_cellar {
+            let pkg_path = cellar_path.join(name);
+            pkg_path.exists() && pkg_path.is_dir()
+        } else {
+            false
         }
     }
 
@@ -98,23 +118,67 @@ impl Installer {
     }
 
     /// Execute the install plan
-    pub async fn execute(&mut self, plan: InstallPlan, link: bool) -> Result<(), Error> {
-        // Download all bottles in parallel
-        let requests: Vec<DownloadRequest> = plan
-            .bottles
+    pub async fn execute(&mut self, plan: InstallPlan, link: bool) -> Result<ExecuteResult, Error> {
+        self.execute_with_progress(plan, link, None).await
+    }
+
+    /// Execute the install plan with progress callback
+    pub async fn execute_with_progress(
+        &mut self,
+        plan: InstallPlan,
+        link: bool,
+        progress: Option<Arc<ProgressCallback>>,
+    ) -> Result<ExecuteResult, Error> {
+        let report = |event: InstallProgress| {
+            if let Some(ref cb) = progress {
+                cb(event);
+            }
+        };
+
+        // Filter out packages already in Homebrew
+        let mut to_install: Vec<(Formula, SelectedBottle)> = Vec::new();
+        let mut skipped_homebrew: Vec<String> = Vec::new();
+
+        for (formula, bottle) in plan.formulas.into_iter().zip(plan.bottles.into_iter()) {
+            if self.is_in_homebrew(&formula.name) {
+                report(InstallProgress::Skipped {
+                    name: formula.name.clone(),
+                });
+                skipped_homebrew.push(formula.name.clone());
+            } else {
+                to_install.push((formula, bottle));
+            }
+        }
+
+        // Download only the bottles we need
+        let requests: Vec<DownloadRequest> = to_install
             .iter()
-            .map(|b| DownloadRequest {
+            .map(|(f, b)| DownloadRequest {
                 url: b.url.clone(),
                 sha256: b.sha256.clone(),
+                name: f.name.clone(),
             })
             .collect();
 
-        let blob_paths = self.downloader.download_all(requests).await?;
+        // Convert progress callback for download
+        let download_progress: Option<DownloadProgressCallback> = progress.clone().map(|cb| {
+            Arc::new(move |event: InstallProgress| {
+                cb(event);
+            }) as DownloadProgressCallback
+        });
+
+        let blob_paths = self
+            .downloader
+            .download_all_with_progress(requests, download_progress)
+            .await?;
 
         // Unpack, materialize, and link each formula
-        for (i, formula) in plan.formulas.iter().enumerate() {
+        for (i, (formula, bottle)) in to_install.iter().enumerate() {
+            report(InstallProgress::UnpackStarted {
+                name: formula.name.clone(),
+            });
+
             let blob_path = &blob_paths[i];
-            let bottle = &plan.bottles[i];
 
             // Use sha256 as store key
             let store_key = &bottle.sha256;
@@ -127,9 +191,20 @@ impl Installer {
                 .cellar
                 .materialize(&formula.name, &formula.versions.stable, &store_entry)?;
 
+            report(InstallProgress::UnpackCompleted {
+                name: formula.name.clone(),
+            });
+
             // Link executables if requested
             let linked_files = if link {
-                self.linker.link_keg(&keg_path)?
+                report(InstallProgress::LinkStarted {
+                    name: formula.name.clone(),
+                });
+                let files = self.linker.link_keg(&keg_path)?;
+                report(InstallProgress::LinkCompleted {
+                    name: formula.name.clone(),
+                });
+                files
             } else {
                 Vec::new()
             };
@@ -152,11 +227,14 @@ impl Installer {
             }
         }
 
-        Ok(())
+        Ok(ExecuteResult {
+            installed: to_install.len(),
+            skipped_homebrew,
+        })
     }
 
     /// Convenience method to plan and execute in one call
-    pub async fn install(&mut self, name: &str, link: bool) -> Result<(), Error> {
+    pub async fn install(&mut self, name: &str, link: bool) -> Result<ExecuteResult, Error> {
         let plan = self.plan(name).await?;
         self.execute(plan, link).await
     }
@@ -219,6 +297,7 @@ pub fn create_installer(
     root: &Path,
     prefix: &Path,
     download_concurrency: usize,
+    homebrew_cellar: Option<PathBuf>,
 ) -> Result<Installer, Error> {
     use std::fs;
 
@@ -234,7 +313,8 @@ pub fn create_installer(
     let store = Store::new(root).map_err(|e| Error::StoreCorruption {
         message: format!("failed to create store: {e}"),
     })?;
-    let cellar = Cellar::new(root).map_err(|e| Error::StoreCorruption {
+    // Use prefix/Cellar so bottles' hardcoded rpaths work
+    let cellar = Cellar::new_at(prefix.join("Cellar")).map_err(|e| Error::StoreCorruption {
         message: format!("failed to create cellar: {e}"),
     })?;
     let linker = Linker::new(prefix).map_err(|e| Error::StoreCorruption {
@@ -250,6 +330,7 @@ pub fn create_installer(
         linker,
         db,
         download_concurrency,
+        homebrew_cellar,
     ))
 }
 
@@ -351,7 +432,7 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
 
         // Install
         installer.install("testpkg", true).await.unwrap();
@@ -423,7 +504,7 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
 
         // Install
         installer.install("uninstallme", true).await.unwrap();
@@ -497,7 +578,7 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
 
         // Install and uninstall
         installer.install("gctest", true).await.unwrap();
@@ -574,7 +655,7 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
 
         // Install but don't uninstall
         installer.install("keepme", true).await.unwrap();
@@ -680,7 +761,7 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
 
         // Install main package (should also install dependency)
         installer.install("mainpkg", true).await.unwrap();

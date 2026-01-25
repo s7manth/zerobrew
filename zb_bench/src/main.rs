@@ -163,7 +163,7 @@ fn create_installer(
     let db = Database::open(&root.join("db/zb.sqlite3"))?;
 
     Ok(Installer::new(
-        api_client, blob_cache, store, cellar, linker, db, 8,
+        api_client, blob_cache, store, cellar, linker, db, 8, None,
     ))
 }
 
@@ -228,36 +228,104 @@ async fn run_smoke_bench() -> Result<SmokeResult, zb_core::Error> {
 }
 
 async fn run_real_bench(formula: &str) -> Result<BenchResult, Box<dyn std::error::Error>> {
-    // For real benchmarks, we'd use the actual Homebrew API
-    // For now, this is a placeholder that shows what the output would look like
+    use std::process::Command;
 
-    println!("Running real benchmark for '{}'...", formula);
-    println!("Note: This requires a working Homebrew installation for comparison.");
+    println!("Running real benchmark for '{}'...\n", formula);
 
     // Check if brew is available
-    let brew_check = std::process::Command::new("brew")
-        .arg("--version")
-        .output();
-
+    let brew_check = Command::new("brew").arg("--version").output();
     if brew_check.is_err() {
         return Err("brew not found in PATH".into());
     }
 
-    // For now, return placeholder data
-    // A real implementation would:
-    // 1. Run `brew install <formula>` and time it
-    // 2. Run `brew uninstall <formula>`
-    // 3. Run `zb install <formula>` and time it
-    // 4. Compare times
+    // Check if zb is available
+    let zb_check = Command::new("zb").arg("--version").output();
+    if zb_check.is_err() {
+        return Err("zb not found in PATH (run: cargo install --path zb_cli)".into());
+    }
 
-    println!("Real benchmarking not yet implemented.");
-    println!("Use 'zb bench smoke' for mocked benchmarks.");
+    // Ensure formula is not installed
+    println!("Cleaning up any existing installations...");
+    let _ = Command::new("brew")
+        .args(["uninstall", "--ignore-dependencies", formula])
+        .output();
+    let _ = Command::new("zb").args(["uninstall", formula]).output();
+
+    // Clean zerobrew caches for cold test
+    let _ = Command::new("rm")
+        .args(["-rf", "/opt/zerobrew/db", "/opt/zerobrew/cache", "/opt/zerobrew/store"])
+        .output();
+
+    // Run Homebrew install (cold)
+    println!("Running: brew install {} (cold)...", formula);
+    let brew_start = Instant::now();
+    let brew_result = Command::new("brew")
+        .args(["install", formula])
+        .output()
+        .expect("Failed to run brew");
+    let brew_cold_ms = brew_start.elapsed().as_millis() as u64;
+
+    if !brew_result.status.success() {
+        let stderr = String::from_utf8_lossy(&brew_result.stderr);
+        eprintln!("brew install failed: {}", stderr);
+        return Err("brew install failed".into());
+    }
+    println!("  Homebrew cold install: {} ms", brew_cold_ms);
+
+    // Uninstall for zerobrew test
+    let _ = Command::new("brew")
+        .args(["uninstall", "--ignore-dependencies", formula])
+        .output();
+
+    // Run zerobrew install (cold - no cache)
+    println!("Running: zb install {} (cold)...", formula);
+    let zb_cold_start = Instant::now();
+    let zb_result = Command::new("zb")
+        .args(["install", formula])
+        .output()
+        .expect("Failed to run zb");
+    let zb_cold_ms = zb_cold_start.elapsed().as_millis() as u64;
+
+    if !zb_result.status.success() {
+        let stderr = String::from_utf8_lossy(&zb_result.stderr);
+        eprintln!("zb install failed: {}", stderr);
+        return Err("zb install failed".into());
+    }
+    println!("  Zerobrew cold install: {} ms", zb_cold_ms);
+
+    // Uninstall for warm test
+    let _ = Command::new("zb").args(["uninstall", formula]).output();
+
+    // Run zerobrew install (warm - cached)
+    println!("Running: zb install {} (warm)...", formula);
+    let zb_warm_start = Instant::now();
+    let zb_warm_result = Command::new("zb")
+        .args(["install", formula])
+        .output()
+        .expect("Failed to run zb");
+    let zb_warm_ms = zb_warm_start.elapsed().as_millis() as u64;
+
+    if !zb_warm_result.status.success() {
+        let stderr = String::from_utf8_lossy(&zb_warm_result.stderr);
+        eprintln!("zb warm install failed: {}", stderr);
+    }
+    println!("  Zerobrew warm install: {} ms", zb_warm_ms);
+
+    // Calculate speedup
+    let cold_speedup = brew_cold_ms as f64 / zb_cold_ms as f64;
+    let warm_speedup = brew_cold_ms as f64 / zb_warm_ms as f64;
+
+    println!("\n=== Results ===");
+    println!("Formula: {}", formula);
+    println!("Homebrew cold:  {} ms", brew_cold_ms);
+    println!("Zerobrew cold:  {} ms ({:.1}x faster)", zb_cold_ms, cold_speedup);
+    println!("Zerobrew warm:  {} ms ({:.1}x faster)", zb_warm_ms, warm_speedup);
 
     Ok(BenchResult {
         name: formula.to_string(),
-        cold_install_ms: 0,
-        warm_reinstall_ms: 0,
-        speedup: 0.0,
+        cold_install_ms: zb_cold_ms,
+        warm_reinstall_ms: zb_warm_ms,
+        speedup: cold_speedup,
     })
 }
 
