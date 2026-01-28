@@ -239,12 +239,12 @@ fn add_to_path(prefix: &Path) -> Result<(), String> {
                 f.write_all(addition.as_bytes())
             });
 
-        if write_result.is_err() {
+        if let Err(e) = write_result {
             println!(
                 "{} Could not write to {} due to error: {}",
                 style("Warning:").yellow().bold(),
                 config_file,
-                write_result.err().unwrap()
+                e
             );
             println!(
                 "{} Please add the following line to {}:",
