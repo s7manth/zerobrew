@@ -42,6 +42,9 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         Commands::Install { formulas, no_link } => {
             commands::install::execute(&mut installer, formulas, no_link).await
         }
+        Commands::Bundle { file, no_link } => {
+            commands::bundle::execute(&mut installer, &file, no_link).await
+        }
         Commands::Uninstall { formula } => commands::uninstall::execute(&mut installer, formula),
         Commands::Migrate { yes, force } => {
             commands::migrate::execute(&mut installer, yes, force).await
